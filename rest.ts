@@ -15,9 +15,20 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { authed, notFound, parseJsonBody, sendEmpty, sendJson, unauthorized, VIEWER } from './http-util.ts';
+import { authed, notFound, parseJsonBody, sendEmpty, sendJson, sendJsonText, unauthorized, VIEWER } from './http-util.ts';
 
 // ---------------------------------------------------------------- serializers
+
+/** Serialized single-issue JSON line for one issue, cached on the repo. Any mutation of
+ *  the issue or its comments must drop that issue's entry (see PATCH issue / POST comment). */
+export function issueJsonText(store: Store, repo: Repo, issue: Issue): { text: string; length: number } {
+  const hit = repo.issueJsonCache.get(issue.number);
+  if (hit) return hit;
+  const text = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+  const entry = { text, length: Buffer.byteLength(text) };
+  repo.issueJsonCache.set(issue.number, entry);
+  return entry;
+}
 
 export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
   const openIssues = [...repo.issues.values()].filter((i) => i.state === 'open').length;
@@ -685,7 +696,8 @@ export function handleRest(
     if (tail.length === 2) {
       if (!issue) return notFound(res), true;
       if (method === 'GET') {
-        sendJson(res, 200, issueJson(store, repo, issue));
+        const cached = issueJsonText(store, repo, issue);
+        sendJsonText(res, 200, cached.text, cached.length);
         return true;
       }
       if (method === 'PATCH') {
@@ -716,6 +728,7 @@ export function handleRest(
           }
           issue.labels = labels;
         }
+        repo.issueJsonCache.delete(n);
         sendJson(res, 200, issueJson(store, repo, issue));
         return true;
       }
@@ -743,6 +756,7 @@ export function handleRest(
         const id = store.nextCommentId++;
         const comment = { id, issueNumber: n, body: commentBody, userLogin: VIEWER.login, createdAt: FIXED_TIME };
         repo.comments.set(id, comment);
+        repo.issueJsonCache.delete(n);
         sendJson(res, 201, commentJson(repo, comment));
         return true;
       }

@@ -61,9 +61,9 @@ export function createApp(): Server {
           return;
         }
 
-        // REST v3.
+        // REST v3. GETs carry no body in this suite; do not wait a tick for one.
         if (segments[0] === 'api' && segments[1] === 'v3') {
-          const body = await readBody(req);
+          const body = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
           handleRest(store, req, res, method, segments, url.searchParams, body);
           return;
         }

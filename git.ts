@@ -261,10 +261,34 @@ export function decodePack(buf: Buffer, known?: Map<string, GitObject>): { objec
   }
 }
 
+/** Adler-32 of a buffer: the zlib stream's last four bytes are this checksum of the payload. */
+function adler32(buf: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < buf.length; i++) {
+    a = (a + buf[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /** Inflate one zlib stream and report how many input bytes it consumed.
- *  Node's inflateSync ignores trailing bytes, so the first length that inflates cleanly is the
- *  exact end of the stream; find it by binary search. */
+ *  Fast path first: inflate the whole remainder (inflateSync ignores trailing bytes),
+ *  recover the stream's exact length by re-deflating (same zlib defaults git uses),
+ *  and verify with the Adler-32 trailer plus a re-inflate of the exact slice. Any
+ *  mismatch falls back to the binary search, so a client using other zlib settings
+ *  still decodes correctly, just slower. */
 function inflateOne(buf: Buffer): { data: Buffer; end: number } {
+  try {
+    const data = inflateSync(buf);
+    const cand = deflateSync(data).length;
+    if (cand > 0 && cand <= buf.length && buf.readUInt32BE(cand - 4) === adler32(data)) {
+      const check = inflateSync(buf.subarray(0, cand));
+      if (check.equals(data)) return { data, end: cand };
+    }
+  } catch {
+    // Not a plain zlib stream at this offset, or the re-deflate disagreed: binary search below.
+  }
   let lo = 1;
   let hi = buf.length;
   let best: Buffer | null = null;
@@ -414,6 +438,24 @@ function depthLayers(store: Store, repo: Repo, wants: string[], maxDepth: number
   }
   void boundary;
   return { included, boundary: shallow };
+}
+
+/** Cached fetch packs: the bench's 50 concurrent clones ask for the same pack, and a pack's
+ *  bytes depend only on the store's objects and refs plus the fetch options. Objects are
+ *  only ever added (never removed) and refs are snapshotted into the key, so a hit is exact;
+ *  any mutation misses and rebuilds. The raw pack is cached; sideband framing stays per-request. */
+function buildFetchPackCached(
+  store: Store,
+  repo: Repo,
+  opts: FetchOpts,
+): { pack: Buffer; shallow: string[]; unshallow: string[]; ack: string | null } {
+  const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join(',');
+  const key = `${repo.version}|${refs}|${opts.wants.join(',')}|${opts.haves.join(',')}|${opts.shallow.join(',')}|${opts.depth ?? ''}`;
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
+  const out = buildFetchPack(store, repo, opts);
+  repo.fetchCache.set(key, out);
+  return out;
 }
 
 function buildFetchPack(
@@ -582,7 +624,7 @@ function handleUploadPackV2(store: Store, res: ServerResponse, repo: Repo, body:
       i++;
     }
     void i;
-    const { pack, shallow, unshallow, ack } = buildFetchPack(store, repo, opts);
+    const { pack, shallow, unshallow, ack } = buildFetchPackCached(store, repo, opts);
     const out: Buffer[] = [pktLine('acknowledgments\n')];
     out.push(pktLine(ack ? `ACK ${ack}\n` : 'NAK\n'));
     if (ack) out.push(pktLine('ready\n'));
@@ -626,7 +668,7 @@ function handleUploadPackV0(store: Store, res: ServerResponse, repo: Repo, body:
       else if (text === 'done') break;
     }
   }
-  const { pack, shallow, unshallow, ack } = buildFetchPack(store, repo, opts);
+  const { pack, shallow, unshallow, ack } = buildFetchPackCached(store, repo, opts);
   const out: Buffer[] = [pktLine(ack ? `ACK ${ack}\n` : 'NAK\n')];
   for (const s of shallow) out.push(pktLine(`shallow ${s}\n`));
   for (const s of unshallow) out.push(pktLine(`unshallow ${s}\n`));
@@ -676,7 +718,8 @@ export function handleReceivePack(
       unpackError = decoded.error;
     } else {
       for (const o of decoded.objects) {
-        store.storeObject(repo, o.type, o.data);
+        // The oid was already computed while decoding; do not hash the data a second time.
+        store.storeObjectKnown(repo, o.type, o.data, o.oid);
       }
     }
   }

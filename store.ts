@@ -77,6 +77,18 @@ export interface Repo {
   comments: Map<number, IssueComment>;
   numberSeq: number;
   commentSeq: number;
+  /** Parsed commits, keyed by oid. Objects are immutable once stored, so this never goes stale. */
+  commitInfo: Map<string, CommitInfo>;
+  /** Full ancestor set per commit oid (the commit itself plus every ancestor). Immutable content, so no invalidation. */
+  ancestorSet: Map<string, Set<string>>;
+  /** Commit oids in creation order (insertion order of storeObject). */
+  commitSeq: string[];
+  /** Bumped on every object/ref mutation; fetch-pack cache keys include it. */
+  version: number;
+  /** Cached fetch packs, keyed by version + refs snapshot + fetch options. */
+  fetchCache: Map<string, { pack: Buffer; shallow: string[]; unshallow: string[]; ack: string | null }>;
+  /** Cached serialized single-issue JSON lines, keyed by issue number. */
+  issueJsonCache: Map<number, { text: string; length: number }>;
 }
 
 /** The identity the forge signs its own commits with (the viewer, per the fixed scenario). */
@@ -212,6 +224,12 @@ export class Store {
       comments: new Map(),
       numberSeq: 0,
       commentSeq: 0,
+      commitInfo: new Map(),
+      ancestorSet: new Map(),
+      commitSeq: [],
+      version: 0,
+      fetchCache: new Map(),
+      issueJsonCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     return repo;
@@ -231,7 +249,16 @@ export class Store {
 
   storeObject(repo: Repo, type: ObjType, data: Buffer): string {
     const oid = sha1Of(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    return this.storeObjectKnown(repo, type, data, oid);
+  }
+
+  /** Store an object whose oid is already known (e.g. a pack entry just decoded): skips re-hashing. */
+  storeObjectKnown(repo: Repo, type: ObjType, data: Buffer, oid: string): string {
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.version += 1;
+      if (type === 'commit') repo.commitSeq.push(oid);
+    }
     return oid;
   }
 
@@ -240,9 +267,45 @@ export class Store {
   }
 
   getCommit(repo: Repo, oid: string): CommitInfo | null {
+    const cached = repo.commitInfo.get(oid);
+    if (cached) return cached;
     const o = repo.objects.get(oid);
     if (!o || o.type !== 'commit') return null;
-    return parseCommit(o.data);
+    const info = parseCommit(o.data);
+    repo.commitInfo.set(oid, info);
+    return info;
+  }
+
+  /** The full ancestor set of one commit (itself included), memoized. Objects are immutable,
+   *  so a set computed once stays correct forever. Iterative post-order: parents before children. */
+  ancestorSetOf(repo: Repo, oid: string): Set<string> {
+    const cached = repo.ancestorSet.get(oid);
+    if (cached) return cached;
+    const order: string[] = [];
+    const seen = new Set<string>();
+    const stack = [oid];
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      if (seen.has(cur) || repo.ancestorSet.has(cur)) continue;
+      seen.add(cur);
+      order.push(cur);
+      const info = this.getCommit(repo, cur);
+      if (info) for (const p of info.parents) stack.push(p);
+    }
+    for (let i = order.length - 1; i >= 0; i--) {
+      const cur = order[i];
+      if (repo.ancestorSet.has(cur)) continue;
+      const set = new Set<string>([cur]);
+      const info = this.getCommit(repo, cur);
+      if (info) {
+        for (const p of info.parents) {
+          const ps = repo.ancestorSet.get(p);
+          if (ps) for (const x of ps) set.add(x);
+        }
+      }
+      repo.ancestorSet.set(cur, set);
+    }
+    return repo.ancestorSet.get(oid) as Set<string>;
   }
 
   /** Peel a tag (recursively) to the commit it names; commits pass through. */
@@ -263,26 +326,20 @@ export class Store {
 
   /** All commit oids reachable from `roots` (tags peeled, parents followed). */
   ancestors(repo: Repo, roots: string[]): Set<string> {
-    const seen = new Set<string>();
-    const stack: string[] = [];
+    const out = new Set<string>();
     for (const r of roots) {
       const c = this.peelToCommit(repo, r);
-      if (c) stack.push(c);
+      if (!c) continue;
+      for (const x of this.ancestorSetOf(repo, c)) out.add(x);
     }
-    while (stack.length > 0) {
-      const oid = stack.pop() as string;
-      if (seen.has(oid)) continue;
-      seen.add(oid);
-      const info = this.getCommit(repo, oid);
-      if (!info) continue;
-      for (const p of info.parents) stack.push(p);
-    }
-    return seen;
+    return out;
   }
 
   isAncestor(repo: Repo, anc: string, desc: string): boolean {
     if (anc === desc) return true;
-    return this.ancestors(repo, [desc]).has(anc);
+    const c = this.peelToCommit(repo, desc);
+    if (!c) return false;
+    return this.ancestorSetOf(repo, c).has(anc);
   }
 
   /** The newest common ancestor of two commits, or null. */

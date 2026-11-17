@@ -24,6 +24,17 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, ext
   res.end(text);
 }
 
+/** Send an already-serialized JSON line (text includes its trailing newline); `length` is its byte length. */
+export function sendJsonText(res: ServerResponse, status: number, text: string, length: number, extra: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': length,
+    'x-github-request-id': nextRequestId(),
+    ...extra,
+  });
+  res.end(text);
+}
+
 export function sendEmpty(res: ServerResponse, status: number, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'x-github-request-id': nextRequestId(), ...extra });
   res.end();
@@ -47,10 +58,15 @@ export function parseJsonBody(body: Buffer): { ok: true; value: unknown } | { ok
   }
 }
 
-/** The bearer token the suite presents; null when the env did not set one (local runs). */
+/** The bearer token the suite presents; null when the env did not set one (local runs).
+ *  Read once: the token never changes during a trial, and process.env reads are not free. */
+let cachedToken: string | null | undefined;
 export function shopToken(): string | null {
-  const t = process.env.MAKEFUN_SHOP_TOKEN;
-  return t && t.length > 0 ? t : null;
+  if (cachedToken === undefined) {
+    const t = process.env.MAKEFUN_SHOP_TOKEN;
+    cachedToken = t && t.length > 0 ? t : null;
+  }
+  return cachedToken;
 }
 
 /** True when the request carries the shop token. With no token configured, any Bearer passes. */
